@@ -55,6 +55,13 @@ def get_head(table: Table) -> Table:
 
     # Итерируемся по оставшимся строкам
     for i in range(1, len(table_data)):
+        # Разделитель секции подписывает идущую ниже группу строк данных
+        # и не задаёт структуру столбцов, поэтому в сопоставлении
+        # с родительскими ячейками не участвует и рядов родителей не расходует
+        if _is_section_divider(table_data[i], old):
+            table_data[i][0].classCell = CellType.ClassCell.CELL_TITLE
+            continue
+
         # Уменьшаем rowspan у всех старых ячеек
         for cell in old:
             cell.rowspan -= 1
@@ -407,19 +414,63 @@ def get_data(table: Table) -> Table:
                     f'Недостаточно ячеек в строке {i}: '
                     f'ожидалась дочерняя ячейка для "{old[k].content}"')
 
-            # В данных требуется строгое соответствие: colspan должны совпадать
+            # Родительская ячейка может делиться на несколько потомков:
+            # так устроен многоуровневый боковик, где, например, падеж "В."
+            # разбивается на "одуш." и "неодуш.". Собираем потомков до тех пор,
+            # пока их суммарная ширина не покроет родителя
             if table_data[i][j].colspan < old[k].colspan:
-                raise LayoutError(
-                    f'Несоответствие colspan в строке {i}: '
-                    f'родительская ячейка "{old[k].content}" имеет colspan={old[k].colspan}, '
-                    f'а дочерняя "{table_data[i][j].content}" имеет colspan={table_data[i][j].colspan}. '
-                    f'В области данных каждая ячейка должна иметь ровно одного потомка с тем же colspan.')
+                covered = 0
+                while j < len(table_data[i]) and covered < old[k].colspan:
+                    child = table_data[i][j]
+
+                    if covered + child.colspan > old[k].colspan:
+                        raise LayoutError(
+                            f'Несоответствие colspan в строке {i}: потомки ячейки '
+                            f'"{old[k].content}" (colspan={old[k].colspan}) в сумме шире родителя')
+
+                    _check_data_type_compatibility(old[k], child)
+                    child.classCell = CellType.ClassCell.CELL_DATA
+                    new.append(child)
+                    covered += child.colspan
+                    j += 1
+
+                if covered != old[k].colspan:
+                    raise LayoutError(
+                        f'Несоответствие colspan в строке {i}: '
+                        f'родительская ячейка "{old[k].content}" имеет colspan={old[k].colspan}, '
+                        f'а потомки покрывают только {covered}.')
+
+                k += 1
+                continue
 
             # Проверка на перерез
             if table_data[i][j].colspan > old[k].colspan:
-                # Проверяем, является ли текущая строка перерезом
-                # is_cross =
-                _check_if_cross_section(table_data[i])
+                # Сначала пробуем прочитать строку как перерез. Если по типам
+                # данных она перерезом не является, проверяем другой случай:
+                # несколько родительских ячеек под одним потомком -- так
+                # многоуровневый боковик возвращается на один уровень
+                try:
+                    _check_if_cross_section(table_data[i])
+                except DataTypeError:
+                    # Объединение допускаем только в боковике: это первая ячейка
+                    # строки, покрывающая крайние слева родительские ячейки
+                    # и при этом не всю строку целиком -- строка во всю ширину
+                    # это перерез, а не боковик
+                    merged = 0
+                    if k == 0 and j == 0:
+                        merged = _count_merged_parents(old, k, table_data[i][j].colspan)
+                        if merged >= len(old):
+                            merged = 0
+                    if not merged:
+                        raise
+
+                    child = table_data[i][j]
+                    _check_data_type_compatibility(old[k], child)
+                    child.classCell = CellType.ClassCell.CELL_DATA
+                    new.append(child)
+                    j += 1
+                    k += merged
+                    continue
                 # if not is_cross:
                 #     raise LayoutError(
                 #         f'Несоответствие colspan в строке {i}: '
@@ -498,6 +549,54 @@ def get_data(table: Table) -> Table:
                 f'но таблица закончилась (выходит за пределы по вертикали)')
 
     return table
+
+def _count_merged_parents(parents: list, start: int, width: int) -> int:
+    """
+    Определяет, сколько подряд идущих родительских ячеек покрывает один потомок.
+
+    Нужен для боковиков переменной глубины: строки "В." и "неодуш." вместе
+    занимают ту же ширину, что одна ячейка "Тв." в следующей строке.
+
+    Args:
+        parents: список родительских ячеек
+        start: индекс, с которого начинается покрытие
+        width: ширина (colspan) дочерней ячейки
+
+    Returns:
+        Количество покрытых родительских ячеек либо 0, если точного покрытия нет
+    """
+    covered = 0
+    for count, cell in enumerate(parents[start:], start=1):
+        covered += cell.colspan
+        if covered == width:
+            return count
+        if covered > width:
+            break
+
+    return 0
+
+
+def _is_section_divider(row: list, parents: list) -> bool:
+    """
+    Проверяет, является ли строка разделителем секции.
+
+    Разделитель -- это одиночная ячейка, растянутая на всю ширину таблицы.
+    Такие строки подписывают группу следующих за ними строк данных
+    (например, "Skin" перед перечислением видов рака кожи) и не описывают
+    структуру столбцов, поэтому при разборе заголовков их пропускают.
+
+    Args:
+        row: ячейки проверяемой строки
+        parents: ячейки предыдущего уровня, задающие ширину таблицы
+
+    Returns:
+        True, если строка является разделителем секции
+    """
+    if len(row) != 1 or not parents:
+        return False
+
+    return row[0].colspan == sum(cell.colspan for cell in parents)
+
 
 def _check_if_cross_section(row: list) -> bool:
     """
