@@ -7,17 +7,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import f1_score, accuracy_score
 from sklearn.inspection import permutation_importance
-from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
-from catboost import CatBoostClassifier
 from bs4 import BeautifulSoup
 from Table import Table
 from CellType import DataType
 import Heuristic
 import warnings
 import os
-import seaborn as sns
-import matplotlib.pyplot as plt
 import time
 
 warnings.filterwarnings('ignore')
@@ -188,6 +183,14 @@ def calculate_permutation_importance(wrapper, X, y, cv, model_name):
 
 
 if __name__ == "__main__":
+    # Градиентный бустинг и графики нужны только при сравнительном прогоне,
+    # поэтому импортируются здесь: разбор таблиц от них не зависит
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from catboost import CatBoostClassifier
+    from lightgbm import LGBMClassifier
+    from xgboost import XGBClassifier
+
     # Загрузка данных
     df = pd.read_json('verified_dataset.json').T
     X = df.html_text
