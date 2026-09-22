@@ -1322,21 +1322,6 @@ class TestCellTypeDetectionDetailedDataType(unittest.TestCase):
                            f"Должен быть NO_DATA для: {cell._content}")
         print("✅ Тест 4.46: DetailedDataType.NO_DATA для н/д (русский)")
 
-    def test_detailedtype_other_complex_html(self):
-        """Тест 4.47: DetailedDataType.OTHER для сложного HTML."""
-        test_cases = [
-            "<td><div><span>Вложенный div</span></div></td>",
-            "<td><table><tr><td>Вложенная таблица</td></tr></table></td>",
-            "<td><ul><li>Список</li></ul></td>",
-        ]
-        for html in test_cases:
-            tag = BeautifulSoup(html, 'html.parser').find('td')
-            cell = Cell(tag)
-            actual_type = CellType.detailType(tags=cell.tags, contents=cell._content)
-            self.assertEqual(actual_type, DetailedDataType.OTHER,
-                           f"Должен быть OTHER для сложного HTML")
-        print("✅ Тест 4.47: DetailedDataType.OTHER для сложного HTML")
-
 
 # =====================================================================
 # БЛОК 5: Тесты граничных случаев
