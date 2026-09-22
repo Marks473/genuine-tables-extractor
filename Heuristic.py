@@ -1,18 +1,97 @@
+"""
+Эвристический разбор структуры HTML-таблицы.
+
+Проверка строится на одном свойстве таблицы данных: её строки образуют
+правильное разбиение. Каждая следующая строка либо повторяет разбиение
+предыдущей, либо дробит её ячейки, но никогда не пересекает их границы.
+
+Разбор ведёт :func:`vertical_check`, последовательно вызывая три стадии:
+:func:`get_head` находит границу блока заголовков, :func:`get_data` проверяет
+область данных, :func:`get_sidebar` -- боковик. Каждая опирается на разметку,
+проставленную предыдущей.
+
+Точка входа для внешнего кода -- :func:`get_genuine` и :func:`is_genuine`.
+"""
 
 import CellType
-from Table import Table
-from Cell import Cell
-from CellType import DetailedDataType
 from CellType import DataType
-from bs4 import Tag
+from Table import Table
 
 from heuristic_errors import TitleTypeError, DataTypeError, LayoutError
 from heuristic_rules import (
-    _check_data_type_compatibility,
-    _check_if_cross_section,
-    _count_merged_parents,
-    _is_section_divider,
+    check_data_type_compatibility,
+    check_cross_section,
+    count_merged_parents,
+    is_section_divider,
 )
+
+ClassCell = CellType.ClassCell
+DetailedDataType = CellType.DetailedDataType
+
+# Типы, допустимые в самой верхней строке заголовков
+FIRST_TITLE_TYPES = {DataType.STRING, DataType.NO_DATA, DataType.LINK}
+
+# Типы, допустимые в заголовках и боковиках ниже первой строки
+HEADER_TYPES = {DataType.GENUINE, DataType.STRING, DataType.LINK}
+
+# Классы, проставленные предыдущими стадиями: разбор боковика их пропускает
+PRECLASSIFIED = {ClassCell.CELL_TITLE, ClassCell.CELL_RESULT}
+
+# Классы, которые разбор боковика не перезаписывает
+KEEP_CLASS = {ClassCell.CELL_DATA, ClassCell.CELL_TITLE, ClassCell.CELL_RESULT}
+
+
+def _require_type(cell, allowed: set, role: str) -> None:
+    """
+    Проверяет, что тип данных ячейки допустим для её роли.
+
+    Args:
+        cell: проверяемая ячейка
+        allowed: множество допустимых типов данных
+        role: название роли в сообщении об ошибке, например "заголовок"
+
+    Raises:
+        TitleTypeError: тип ячейки не входит в допустимые
+    """
+    if cell.type not in allowed:
+        raise TitleTypeError(
+            f'Ячейка-{role}: "{cell.content}" имеет неправильный тип {cell.type}')
+
+
+def _open_block(row: list, allowed: set, role_class, role: str, skip: set) -> list:
+    """
+    Размечает верхнюю строку блока и возвращает её ячейки как родительские.
+
+    Args:
+        row: первая строка блока
+        allowed: допустимые типы данных
+        role_class: класс, который присваивается ячейкам
+        role: название роли в сообщениях об ошибках
+        skip: классы ячеек, которые в блок не входят
+
+    Returns:
+        Список размеченных ячеек
+
+    Raises:
+        TitleTypeError: в строке встретился недопустимый тип данных
+    """
+    parents = []
+    for cell in row:
+        if cell.classCell in skip:
+            continue
+        _require_type(cell, allowed, role)
+        cell.classCell = role_class
+        parents.append(cell)
+
+    return parents
+
+
+def _next_child(row: list, position: int, skip: set) -> int:
+    """Возвращает позицию следующей ячейки строки, пропуская уже размеченные."""
+    while position < len(row) and row[position].classCell in skip:
+        position += 1
+
+    return position
 
 
 def vertical_check(table: Table) -> Table:
@@ -43,530 +122,394 @@ def vertical_check(table: Table) -> Table:
         get_sidebar(table)
     return table
 
-def get_head(table: Table) -> Table:
-    """
-    Проверяет, что заголовки не зубчатые (заканчиваются на одной линии).
-    Помечает все заголовки как CELL_TITLE, первую строку данных как CELL_DATA.
 
-    Returns:
-        Table с размеченными классами ячеек
+def _mark_block(rows: list, allowed: set, role_class, role: str, skip: set,
+                close, strict: bool, dead_end: str) -> None:
+    """
+    Общий обход блока заголовков или боковика.
+
+    Заголовки сверху и боковик слева проверяются одним правилом: каждая
+    следующая строка блока должна точно разбивать ячейки предыдущей. Боковик
+    разбирается на транспонированной таблице и потому обходится тем же кодом;
+    различаются только роль ячеек и способ завершения блока.
+
+    Ячейки предыдущего уровня выступают родителями, ячейки текущей строки --
+    потомками. Потомки набираются, пока их суммарная ширина не совпадёт
+    с шириной родителя. Единственный потомок у единственного родителя в начале
+    строки означает, что блок кончился и началась область данных.
+
+    Args:
+        rows: строки таблицы, для боковика -- транспонированной
+        allowed: допустимые типы данных в верхней строке блока
+        role_class: класс, который присваивается ячейкам блока
+        role: название роли в сообщениях об ошибках
+        skip: классы ячеек, которые обход пропускает
+        close: функция разметки первой строки данных
+        strict: требовать, чтобы строка целиком покрывала родителей
+        dead_end: сообщение, если строка данных так и не нашлась
 
     Raises:
-        TitleTypeError: если заголовок содержит неправильный тип данных
-        LayoutError: если структура нарушена или заголовки "зубчатые"
+        TitleTypeError: в блоке встретился недопустимый тип данных
+        LayoutError: нарушена структура либо блок "зубчатый"
     """
-    table_data = table.table
+    if len(rows) < 2:
+        raise LayoutError(f"Таблица должна иметь минимум 2 строки ({role} + данные)")
 
-    if len(table_data) < 2:
-        raise LayoutError("Таблица должна иметь минимум 2 строки (заголовок + данные)")
+    parents = _open_block(rows[0], allowed, role_class, role, skip)
 
-    # Начинаем с первой строки (родительские ячейки)
-    old = []
-    for cell in table_data[0]:
-        if cell.type not in {DataType.STRING, DataType.NO_DATA, DataType.LINK}:
-            raise TitleTypeError(f'Ячейка-заголовок: "{cell.content}" имеет неправильный тип {cell.type}')
-        cell.classCell = CellType.ClassCell.CELL_TITLE
-        old.append(cell)
+    if not parents:
+        raise LayoutError(
+            f"В первой строке нет ячеек роли <<{role}>>: "
+            f"все они размечены предыдущей стадией")
 
-    new = []
+    for index in range(1, len(rows)):
+        row = rows[index]
 
-    # Итерируемся по оставшимся строкам
-    for i in range(1, len(table_data)):
         # Разделитель секции подписывает идущую ниже группу строк данных
         # и не задаёт структуру столбцов, поэтому в сопоставлении
         # с родительскими ячейками не участвует и рядов родителей не расходует
-        if _is_section_divider(table_data[i], old):
-            table_data[i][0].classCell = CellType.ClassCell.CELL_TITLE
+        if is_section_divider(row, parents):
+            row[0].classCell = ClassCell.CELL_TITLE
             continue
 
-        # Уменьшаем rowspan у всех старых ячеек
-        for cell in old:
-            cell.rowspan -= 1
+        for parent in parents:
+            parent.rowspan -= 1
 
-        j = 0  # Индекс дочерней ячейки в текущей строке
-        s = 0  # Сумма длин (colspan) дочерних ячеек
-        k = 0  # Индекс родительской ячейки
+        marked = []       # ячейки блока в этой строке: родители для следующей
+        child_index = 0   # позиция в текущей строке
+        parent_index = 0  # позиция в списке родителей
+        covered = 0       # ширина, уже покрытая потомками текущего родителя
+        consumed = 0      # сколько потомков уже отнесено к блоку
 
-        while k < len(old):
-            # Если родительская ячейка еще "активна" (rowspan > 0)
-            if old[k].rowspan > 0:
-                new.append(old[k])
-                k += 1
+        while parent_index < len(parents):
+            child_index = _next_child(row, child_index, skip)
+            parent = parents[parent_index]
+
+            # Родитель растянут на эту строку, потомков для него здесь нет
+            if parent.rowspan > 0:
+                marked.append(parent)
+                parent_index += 1
                 continue
 
-            # Проверяем наличие дочерней ячейки
-            if j >= len(table_data[i]):
+            if child_index >= len(row):
                 raise LayoutError(
-                    f'Недостаточно ячеек в строке {i}: ожидалось покрытие ячейки "{old[k].content}"')
+                    f'Недостаточно ячеек в строке {index}: '
+                    f'ожидалось покрытие ячейки "{parent.content}"')
 
-            # Сумма длин дочерних меньше родительской
-            if (s + table_data[i][j].colspan) < old[k].colspan:
-                s += table_data[i][j].colspan
+            child = row[child_index]
+            width = covered + child.colspan
 
-                # Проверка, что заголовок это строка
-                if table_data[i][j].type not in {DataType.GENUINE, DataType.STRING, DataType.LINK}:
-                    raise TitleTypeError(
-                        f'Ячейка-заголовок: "{table_data[i][j].content}" имеет неправильный тип "{table_data[i][j].type}"')
+            if width > parent.colspan:
+                raise LayoutError(
+                    f'Ячейка "{child.content}" (colspan={child.colspan}) выходит за границы '
+                    f'родительской ячейки "{parent.content}" (colspan={parent.colspan})')
 
-                table_data[i][j].classCell = CellType.ClassCell.CELL_TITLE
-                new.append(table_data[i][j])
-                j += 1
-                continue
+            # Ширина сошлась, и потомок был первым и единственным:
+            # блок кончился, эта строка -- первая строка данных
+            if width == parent.colspan and covered == 0:
+                if consumed > 0:
+                    raise LayoutError(
+                        f'Блок роли <<{role}>> зубчатый: ячейка данных '
+                        f'"{child.content}" находится правее ячейки блока')
 
-            # Сумма длин дочерних равна родительской
-            if (s + table_data[i][j].colspan) == old[k].colspan:
-                if s == 0:
-                    # Один родитель = один потомок → это первая ячейка данных
-                    # Значит, ВСЕ заголовки закончились на предыдущей строке
+                close(row, index, parents, parent_index, child_index)
+                return
 
-                    # Проверяем, что слева нет других ячеек (иначе "зубчатые" заголовки)
-                    if j > 0:
-                        raise LayoutError(
-                            f'Заголовки "зубчатые": ячейка данных "{table_data[i][j].content}" '
-                            f'находится справа от ячейки заголовка "{table_data[i][j - 1].content}"')
+            _require_type(child, HEADER_TYPES, role)
+            child.classCell = role_class
+            marked.append(child)
+            consumed += 1
+            child_index += 1
 
-                    # Помечаем текущую ячейку как данные
-                    table_data[i][j].classCell = CellType.ClassCell.CELL_DATA
-                    j += 1
-                    k += 1
+            # Родитель покрыт целиком -- переходим к следующему
+            if width == parent.colspan:
+                covered = 0
+                parent_index += 1
+            else:
+                covered = width
 
-                    # Теперь проверяем, что ВСЕ оставшиеся ячейки в строке тоже данные
-                    # и соответствуют структуре (нет активных rowspan у заголовков)
-
-                    while k < len(old):
-                        # print(old[k].content, table_data[i][j].content, '<<<<')
-                        # Проверяем, что родительская ячейка закончилась
-
-                        if old[k].rowspan > 0:
-                            raise LayoutError(
-                                f'Заголовки "зубчатые": ячейка-заголовок "{old[k].content}" '
-                                f'выступает за строку {i} (rowspan={old[k].rowspan})')
-                        # if old[k].rowspan == 1:
-                        #     k += 1
-                        #     continue
-                        # Проверяем наличие дочерней ячейки
-                        if j >= len(table_data[i]):
-                            raise LayoutError(
-                                f'Недостаточно ячеек данных в строке {i}: '
-                                f'ожидалось покрытие ячейки "{old[k].content}"')
-
-                        # Проверяем соответствие colspan
-                        if table_data[i][j].colspan != old[k].colspan:
-                            raise LayoutError(
-                                f'Заголовки "зубчатые": ячейка данных "{table_data[i][j].content}" '
-                                f'(colspan={table_data[i][j].colspan}) не соответствует '
-                                f'заголовку "{old[k].content}" (colspan={old[k].colspan})')
-
-                        # Помечаем как данные
-                        table_data[i][j].classCell = CellType.ClassCell.CELL_DATA
-                        k += 1
-                        j += 1
-
-                    # Проверяем, что обработали все ячейки корректно
-                    if not ((j == len(table_data[i])) and (k == len(old))):
-                        raise LayoutError(
-                            f'Несоответствие структуры в строке {i}: '
-                            f'обработано {j} из {len(table_data[i])} ячеек')
-
-                    # Все проверки пройдены - таблица валидна, заголовки размечены
-                    return table
-
-                else:
-                    # Один родитель = несколько потомков (и этот последний)
-                    # Это всё ещё заголовки
-                    if table_data[i][j].type not in {DataType.GENUINE, DataType.STRING, DataType.LINK}:
-                        raise TitleTypeError(
-                            f'Ячейка-заголовок: "{table_data[i][j].content}" '
-                            f'имеет неправильный тип "{table_data[i][j].type}"')
-
-                    s = 0  # Сбрасываем счетчик
-                    table_data[i][j].classCell = CellType.ClassCell.CELL_TITLE
-                    new.append(table_data[i][j])
-                    j += 1
-                    k += 1
-                    continue
-
-            # Несоответствие структуры (сумма > родительской)
+        if strict and (child_index != len(row) or parent_index != len(parents)):
             raise LayoutError(
-                f'Ячейка "{table_data[i][j].content}" (colspan={table_data[i][j].colspan}) '
-                f'выходит за границы родительской ячейки "{old[k].content}" (colspan={old[k].colspan})')
+                f'Несоответствие структуры в строке {index}: обработано {child_index} '
+                f'из {len(row)} ячеек, {parent_index} из {len(parents)} родителей')
 
-        # Проверяем, что обработали все ячейки в строке
-        if not ((j == len(table_data[i])) and (k == len(old))):
+        parents = marked
+
+    raise LayoutError(dead_end)
+
+
+def get_head(table: Table) -> Table:
+    """
+    Размечает блок заголовков и находит первую строку данных.
+
+    Заголовки не должны быть "зубчатыми", то есть обязаны заканчиваться
+    на одной линии. Ячейки блока получают класс ``CELL_TITLE``, ячейки
+    первой строки данных -- ``CELL_DATA``.
+
+    Args:
+        table: таблица, размечается на месте
+
+    Returns:
+        Ту же таблицу с размеченными заголовками
+
+    Raises:
+        TitleTypeError: заголовок содержит недопустимый тип данных
+        LayoutError: нарушена структура либо заголовки "зубчатые"
+    """
+    _mark_block(table.table, FIRST_TITLE_TYPES, ClassCell.CELL_TITLE, "заголовок",
+                skip=set(), close=_close_head, strict=True,
+                dead_end="В таблице нет ячеек данных - только заголовки")
+
+    return table
+
+
+def _close_head(row: list, index: int, parents: list,
+                parent_index: int, child_index: int) -> None:
+    """
+    Размечает первую строку данных, завершая разбор заголовков.
+
+    Первая ячейка строки уже опознана как данные вызывающим кодом. Здесь
+    проверяется, что и остальные ячейки строки соответствуют родителям:
+    ни один заголовок не растянут на эту строку, а ширины совпадают.
+
+    Args:
+        row: первая строка данных
+        index: номер строки, нужен для сообщений об ошибках
+        parents: ячейки последнего уровня заголовков
+        parent_index: позиция родителя, с которого продолжается проверка
+        child_index: позиция ячейки данных, которая уже опознана
+
+    Raises:
+        LayoutError: заголовки "зубчатые" либо строка не покрывает родителей
+    """
+    row[child_index].classCell = ClassCell.CELL_DATA
+    child_index += 1
+    parent_index += 1
+
+    while parent_index < len(parents):
+        parent = parents[parent_index]
+
+        if parent.rowspan > 0:
             raise LayoutError(
-                f'Несоответствие структуры в строке {i}: '
-                f'обработано {j} из {len(table_data[i])} ячеек, {k} из {len(old)} родителей')
+                f'Заголовки "зубчатые": ячейка-заголовок "{parent.content}" '
+                f'выступает за строку {index} (rowspan={parent.rowspan})')
 
-        # Переносим обработанные ячейки в "старые"
-        old = [cell for cell in new]
-        new = []
+        if child_index >= len(row):
+            raise LayoutError(
+                f'Недостаточно ячеек данных в строке {index}: '
+                f'ожидалось покрытие ячейки "{parent.content}"')
 
-    # Если дошли до конца и не нашли строку данных
-    raise LayoutError('В таблице нет ячеек данных - только заголовки')
+        child = row[child_index]
+        if child.colspan != parent.colspan:
+            raise LayoutError(
+                f'Заголовки "зубчатые": ячейка данных "{child.content}" '
+                f'(colspan={child.colspan}) не соответствует '
+                f'заголовку "{parent.content}" (colspan={parent.colspan})')
+
+        child.classCell = ClassCell.CELL_DATA
+        parent_index += 1
+        child_index += 1
+
+    if child_index != len(row) or parent_index != len(parents):
+        raise LayoutError(
+            f'Несоответствие структуры в строке {index}: '
+            f'обработано {child_index} из {len(row)} ячеек')
+
 
 def get_sidebar(table: Table) -> Table:
     """
-    Проверяет, что боковики не зубчатые (заканчиваются на одной линии).
-    Помечает все боковики как CELL_SIDEBAR, первый столбец данных как CELL_DATA.
+    Размечает боковик -- заголовки строк.
+
+    Работает на транспонированной таблице: боковик при повороте становится
+    заголовком, и к нему применяется тот же разбор, что и к заголовкам.
+    Ячейки боковика получают класс ``CELL_SIDEBAR``, первый столбец данных --
+    ``CELL_DATA``. Ячейки, размеченные предыдущими стадиями, пропускаются.
+
+    Args:
+        table: таблица, размечается на месте
 
     Returns:
-        Table с размеченными классами ячеек
+        Ту же таблицу в исходной ориентации с размеченным боковиком
 
     Raises:
-        TitleTypeError: если боковик содержит неправильный тип данных
-        LayoutError: если структура нарушена или боковики "зубчатые"
+        TitleTypeError: боковик содержит недопустимый тип данных
+        LayoutError: нарушена структура либо боковики "зубчатые"
     """
     table.reset_span()
     table.transpose
-    table_data = table.table
 
-    if len(table_data) < 2:
-        raise LayoutError("Таблица должна иметь минимум 2 строки (боковик + данные)")
+    _mark_block(table.table, HEADER_TYPES, ClassCell.CELL_SIDEBAR, "боковик",
+                skip=PRECLASSIFIED, close=_close_sidebar, strict=False,
+                dead_end="В таблице нет ячеек данных - только боковики")
 
-    # Начинаем с первой строки (родительские ячейки)
-    old = []
-    for cell in table_data[0]:
-        # Пропускаем заголовки и результаты
-        if cell.classCell in {CellType.ClassCell.CELL_TITLE, CellType.ClassCell.CELL_RESULT}:
-            continue
-        if cell.type not in {DataType.GENUINE, DataType.STRING, DataType.LINK}:
-            raise TitleTypeError(f'Ячейка-боковик: "{cell.content}" имеет неправильный тип {cell.type}')
-        cell.classCell = CellType.ClassCell.CELL_SIDEBAR
-        old.append(cell)
+    table.reset_span()
+    table.transpose
 
-    if len(old) == 0:
-        raise LayoutError("В первой строке нет боковиков (все ячейки - заголовки или результаты)")
-
-    new = []
-
-    # Итерируемся по оставшимся строкам
-    for i in range(1, len(table_data)):
-        # Разделитель секции подписывает идущую ниже группу строк данных
-        # и не задаёт структуру столбцов, поэтому в сопоставлении
-        # с родительскими ячейками не участвует и рядов родителей не расходует
-        if _is_section_divider(table_data[i], old):
-            table_data[i][0].classCell = CellType.ClassCell.CELL_TITLE
-            continue
-
-        # Уменьшаем rowspan у всех старых ячеек
-        for cell in old:
-            cell.rowspan -= 1
-
-        j = 0  # Индекс дочерней ячейки в текущей строке
-        s = 0  # Сумма длин (colspan) дочерних ячеек
-        k = 0  # Индекс родительской ячейки
-        sidebar_count = 0  # Сколько боковиков обработано в текущей строке
-
-        while k < len(old):
-            # Пропускаем заголовки и результаты
-            while j < len(table_data[i]) and table_data[i][j].classCell in {CellType.ClassCell.CELL_TITLE, CellType.ClassCell.CELL_RESULT}:
-                j += 1
-
-            # Если родительская ячейка еще "активна" (rowspan > 0)
-            if old[k].rowspan > 0:
-                new.append(old[k])
-                k += 1
-                continue
-
-            # Проверяем наличие дочерней ячейки
-            if j >= len(table_data[i]):
-                raise LayoutError(
-                    f'Недостаточно ячеек в строке {i}: ожидалось покрытие ячейки "{old[k].content}"')
-
-            # Сумма длин дочерних меньше родительской
-            if (s + table_data[i][j].colspan) < old[k].colspan:
-                s += table_data[i][j].colspan
-                # Проверка, что боковик это строка
-                if table_data[i][j].type not in {DataType.GENUINE, DataType.STRING, DataType.LINK}:
-                    raise TitleTypeError(
-                        f'Ячейка-боковик: "{table_data[i][j].content}" имеет неправильный тип "{table_data[i][j].type}"')
-                table_data[i][j].classCell = CellType.ClassCell.CELL_SIDEBAR
-                new.append(table_data[i][j])
-                sidebar_count += 1
-                j += 1
-                continue
-
-            # Сумма длин дочерних равна родительской
-            if (s + table_data[i][j].colspan) == old[k].colspan:
-                if s == 0:
-                    # Один родитель = один потомок → это первая ячейка данных
-                    # Значит, ВСЕ боковики закончились на предыдущей строке
-
-                    # Проверяем, что слева нет других боковиков (иначе "зубчатые" боковики)
-                    if sidebar_count > 0:
-                        raise LayoutError(
-                            f'Боковики "зубчатые": ячейка данных "{table_data[i][j].content}" '
-                            f'находится справа от ячейки боковика')
-
-                    # Помечаем текущую ячейку как данные (только если она еще не помечена)
-                    if table_data[i][j].classCell not in {CellType.ClassCell.CELL_DATA,
-                                                           CellType.ClassCell.CELL_TITLE,
-                                                           CellType.ClassCell.CELL_RESULT}:
-                        table_data[i][j].classCell = CellType.ClassCell.CELL_DATA
-                    j += 1
-                    k += 1
-
-                    # Теперь проверяем, что ВСЕ оставшиеся ячейки в строке тоже данные
-                    # и соответствуют структуре (нет активных rowspan у боковиков)
-                    while k < len(old):
-                        # Пропускаем заголовки и результаты
-                        while j < len(table_data[i]) and table_data[i][j].classCell in {CellType.ClassCell.CELL_TITLE, CellType.ClassCell.CELL_RESULT}:
-                            j += 1
-
-                        # Проверяем, что родительская ячейка закончилась
-                        if old[k].rowspan > 1:
-                            raise LayoutError(
-                                f'Боковики "зубчатые": ячейка-боковик "{old[k].content}" '
-                                f'выступает за строку {i} (rowspan={old[k].rowspan})')
-
-                        if old[k].rowspan == 1:
-                            k += 1
-                            continue
-
-                        # Проверяем наличие дочерней ячейки
-                        if j >= len(table_data[i]):
-                            raise LayoutError(
-                                f'Недостаточно ячеек данных в строке {i}: '
-                                f'ожидалось покрытие ячейки "{old[k].content}"')
-
-                        # Проверяем соответствие colspan
-                        if table_data[i][j].colspan != old[k].colspan:
-                            raise LayoutError(
-                                f'Боковики "зубчатые": ячейка данных "{table_data[i][j].content}" '
-                                f'(colspan={table_data[i][j].colspan}) не соответствует '
-                                f'боковику "{old[k].content}" (colspan={old[k].colspan})')
-
-                        # Помечаем как данные (только если еще не помечена)
-                        if table_data[i][j].classCell not in {CellType.ClassCell.CELL_DATA,
-                                                               CellType.ClassCell.CELL_TITLE,
-                                                               CellType.ClassCell.CELL_RESULT}:
-                            table_data[i][j].classCell = CellType.ClassCell.CELL_DATA
-                        k += 1
-                        j += 1
-
-                    # Все проверки пройдены - боковики размечены
-                    # table_transpose.reset_span()
-                    # table_transpose.print()
-                    table.reset_span()
-                    # table_transpose.print()
-                    table.transpose
-                    # result_table.print()
+    return table
 
 
-                    return table
+def _close_sidebar(row: list, index: int, parents: list,
+                   parent_index: int, child_index: int) -> None:
+    """
+    Размечает первый столбец данных, завершая разбор боковика.
 
-                else:
-                    # Один родитель = несколько потомков (и этот последний)
-                    # Это всё ещё боковики
-                    if table_data[i][j].type not in {DataType.GENUINE, DataType.STRING, DataType.LINK}:
-                        raise TitleTypeError(
-                            f'Ячейка-боковик: "{table_data[i][j].content}" '
-                            f'имеет неправильный тип "{table_data[i][j].type}"')
-                    s = 0  # Сбрасываем счетчик
-                    table_data[i][j].classCell = CellType.ClassCell.CELL_SIDEBAR
-                    new.append(table_data[i][j])
-                    sidebar_count += 1
-                    j += 1
-                    k += 1
-                    continue
+    В отличие от :func:`_close_head`, уже размеченные классы не перезаписываются,
+    а родитель с ``rowspan == 1`` пропускается: боковик мог закончиться раньше
+    остальных столбцов.
 
-            # Несоответствие структуры (сумма > родительской)
+    Args:
+        row: первый столбец данных, в транспонированном виде -- строка
+        index: номер строки для сообщений об ошибках
+        parents: ячейки последнего уровня боковика
+        parent_index: позиция родителя, с которого продолжается проверка
+        child_index: позиция ячейки данных, которая уже опознана
+
+    Raises:
+        LayoutError: боковики "зубчатые" либо ширины не совпадают
+    """
+    if row[child_index].classCell not in KEEP_CLASS:
+        row[child_index].classCell = ClassCell.CELL_DATA
+    child_index += 1
+    parent_index += 1
+
+    while parent_index < len(parents):
+        child_index = _next_child(row, child_index, PRECLASSIFIED)
+        parent = parents[parent_index]
+
+        if parent.rowspan > 1:
             raise LayoutError(
-                f'Ячейка "{table_data[i][j].content}" (colspan={table_data[i][j].colspan}) '
-                f'выходит за границы родительской ячейки "{old[k].content}" (colspan={old[k].colspan})')
+                f'Боковики "зубчатые": ячейка-боковик "{parent.content}" '
+                f'выступает за строку {index} (rowspan={parent.rowspan})')
 
-        # Переносим обработанные ячейки в "старые"
-        old = [cell for cell in new]
-        new = []
+        # Боковик закончился на предыдущей строке, потомка для него здесь нет
+        if parent.rowspan == 1:
+            parent_index += 1
+            continue
 
-    # Если дошли до конца и не нашли столбец данных
-    raise LayoutError('В таблице нет ячеек данных - только боковики')
+        if child_index >= len(row):
+            raise LayoutError(
+                f'Недостаточно ячеек данных в строке {index}: '
+                f'ожидалось покрытие ячейки "{parent.content}"')
+
+        child = row[child_index]
+        if child.colspan != parent.colspan:
+            raise LayoutError(
+                f'Боковики "зубчатые": ячейка данных "{child.content}" '
+                f'(colspan={child.colspan}) не соответствует '
+                f'боковику "{parent.content}" (colspan={parent.colspan})')
+
+        if child.classCell not in KEEP_CLASS:
+            child.classCell = ClassCell.CELL_DATA
+        parent_index += 1
+        child_index += 1
+
+
 
 def get_data(table: Table) -> Table:
     """
-    Проверяет корректность области данных после разметки заголовков.
-    Запускается ПОСЛЕ get_hed, проверяет:
-    - Каждая родительская ячейка имеет РОВНО одного потомка с тем же colspan
-    - Типы данных в столбцах согласованы
-    - Обрабатывает перерезы (итоговые строки)
+    Проверяет область данных после разметки заголовков.
+
+    Требование строже, чем к заголовкам: у родительской ячейки должен быть
+    ровно один потомок той же ширины. Из этого правила есть два исключения --
+    перерез (итоговая строка во всю ширину) и объединение ячеек боковика.
+
+    Args:
+        table: таблица, размечается на месте
 
     Returns:
-        Table с размеченными ячейками данных (CELL_DATA) и результатов (CELL_RESULT)
+        Ту же таблицу с размеченными данными (``CELL_DATA``)
+        и итоговыми строками (``CELL_RESULT``)
 
     Raises:
-        LayoutError: если структура некорректна
-        DataTypeError: если типы данных в столбце несовместимы
+        LayoutError: нарушена структура области данных
+        DataTypeError: типы данных в столбце несовместимы
     """
-    table_data = table.table
+    rows = table.table
 
-    if len(table_data) < 2:
+    if len(rows) < 2:
         raise LayoutError("Таблица должна иметь минимум 2 строки (заголовок + данные)")
 
-    # Находим первую строку данных (помеченную get_hed)
+    # Первую строку данных уже нашла стадия разбора заголовков
     start = 0
-    while start < len(table_data) and table_data[start][0].classCell == CellType.ClassCell.CELL_TITLE:
+    while start < len(rows) and rows[start][0].classCell == ClassCell.CELL_TITLE:
         start += 1
 
-    if start >= len(table_data):
+    if start >= len(rows):
         raise LayoutError("В таблице нет строк с данными")
 
-    # Начинаем с первой строки данных (родительские ячейки)
-    old = [cell for cell in table_data[start]]
+    width = sum(cell.colspan for cell in rows[start])
+    parents = list(rows[start])
 
-    # Итерируемся по оставшимся строкам данных
-    for i in range(start + 1, len(table_data)):
-        # Уменьшаем rowspan у всех старых ячеек
-        for cell in old:
-            cell.rowspan -= 1
+    for index in range(start + 1, len(rows)):
+        row = rows[index]
 
-        new = []
-        j = 0  # Индекс дочерней ячейки в текущей строке
-        k = 0  # Индекс родительской ячейки
+        for parent in parents:
+            parent.rowspan -= 1
 
-        while k < len(old):
+        marked = []
+        child_index = 0
+        parent_index = 0
 
+        while parent_index < len(parents):
+            parent = parents[parent_index]
 
-            # Если родительская ячейка еще "активна" (rowspan > 0)
-            if old[k].rowspan > 0:
-                new.append(old[k])
-                k += 1
+            # Родитель растянут на эту строку, потомка для него здесь нет
+            if parent.rowspan > 0:
+                marked.append(parent)
+                parent_index += 1
                 continue
 
-            # Проверяем наличие дочерней ячейки
-            if j >= len(table_data[i]):
+            if child_index >= len(row):
                 raise LayoutError(
-                    f'Недостаточно ячеек в строке {i}: '
-                    f'ожидалась дочерняя ячейка для "{old[k].content}"')
+                    f'Недостаточно ячеек в строке {index}: '
+                    f'ожидалась дочерняя ячейка для "{parent.content}"')
 
-            # Родительская ячейка может делиться на несколько потомков:
-            # так устроен многоуровневый боковик, где, например, падеж "В."
-            # разбивается на "одуш." и "неодуш.". Собираем потомков до тех пор,
-            # пока их суммарная ширина не покроет родителя
-            if table_data[i][j].colspan < old[k].colspan:
-                covered = 0
-                while j < len(table_data[i]) and covered < old[k].colspan:
-                    child = table_data[i][j]
+            child = row[child_index]
 
-                    if covered + child.colspan > old[k].colspan:
-                        raise LayoutError(
-                            f'Несоответствие colspan в строке {i}: потомки ячейки '
-                            f'"{old[k].content}" (colspan={old[k].colspan}) в сумме шире родителя')
-
-                    _check_data_type_compatibility(old[k], child)
-                    child.classCell = CellType.ClassCell.CELL_DATA
-                    new.append(child)
-                    covered += child.colspan
-                    j += 1
-
-                if covered != old[k].colspan:
-                    raise LayoutError(
-                        f'Несоответствие colspan в строке {i}: '
-                        f'родительская ячейка "{old[k].content}" имеет colspan={old[k].colspan}, '
-                        f'а потомки покрывают только {covered}.')
-
-                k += 1
+            if child.colspan < parent.colspan:
+                child_index = _split_parent(row, index, parent, child_index, marked)
+                parent_index += 1
                 continue
 
-            # Проверка на перерез
-            if table_data[i][j].colspan > old[k].colspan:
-                # Сначала пробуем прочитать строку как перерез. Если по типам
-                # данных она перерезом не является, проверяем другой случай:
-                # несколько родительских ячеек под одним потомком -- так
-                # многоуровневый боковик возвращается на один уровень
-                try:
-                    _check_if_cross_section(table_data[i])
-                except DataTypeError:
-                    # Объединение допускаем только в боковике: это первая ячейка
-                    # строки, покрывающая крайние слева родительские ячейки
-                    # и при этом не всю строку целиком -- строка во всю ширину
-                    # это перерез, а не боковик
-                    merged = 0
-                    if k == 0 and j == 0:
-                        merged = _count_merged_parents(old, k, table_data[i][j].colspan)
-                        if merged >= len(old):
-                            merged = 0
-                    if not merged:
-                        raise
-
-                    child = table_data[i][j]
-                    _check_data_type_compatibility(old[k], child)
-                    child.classCell = CellType.ClassCell.CELL_DATA
-                    new.append(child)
-                    j += 1
-                    k += merged
+            if child.colspan > parent.colspan:
+                merged = _merge_parents(row, parents, parent_index, child_index, marked)
+                if merged:
+                    child_index += 1
+                    parent_index += merged
                     continue
-                # if not is_cross:
-                #     raise LayoutError(
-                #         f'Несоответствие colspan в строке {i}: '
-                #         f'родительская ячейка "{old[k].content}" имеет colspan={old[k].colspan}, '
-                #         f'а дочерняя "{table_data[i][j].content}" имеет colspan={table_data[i][j].colspan}. '
-                #         f'Строка не соответствует структуре переза.')
 
-                # Проверяем, что перед перерезом были данные (CELL_DATA)
-                has_data_before = any(cell.classCell == CellType.ClassCell.CELL_DATA
-                                      for row in table_data[start:i]
-                                      for cell in row)
+                _mark_cross_section(rows, row, index, start, parents, width)
+                marked = []
+                break
 
-                if not has_data_before:
-                    raise LayoutError(
-                        f'Перед перерезом в строке {i} должны быть ячейки с данными (CELL_DATA)')
+            check_data_type_compatibility(parent, child)
+            child.classCell = ClassCell.CELL_DATA
 
-                # Проверяем, что перерез на всю ширину таблицы
-                total_colspan = sum(cell.colspan for cell in table_data[i])
-                expected_width = sum(cell.colspan for cell in table_data[start])
-
-                if total_colspan != expected_width:
-                    raise LayoutError(
-                        f'Перерез в строке {i} должен быть на всю ширину таблицы. '
-                        f'Ожидается {expected_width}, получено {total_colspan}')
-
-                # Помечаем все ячейки переза как CELL_RESULT
-                for cell in table_data[i]:
-                    cell.classCell = CellType.ClassCell.CELL_RESULT
-
-                # Восстанавливаем rowspan для old (так как мы его уменьшили в начале цикла)
-                for cell in old:
-                    cell.rowspan = 1
-
-                # old остается без изменений - следующая строка будет проверяться
-                # относительно строки перед перерезом (как будто переза не было)
-                new = []
-                k = 0
-                # if j == len(table_data):
-                #     return table
-                break  # Выходим из while, переходим к следующей строке
-
-            # Проверяем согласованность типов данных
-            _check_data_type_compatibility(old[k], table_data[i][j])
-
-            # Помечаем как данные
-            table_data[i][j].classCell = CellType.ClassCell.CELL_DATA
-            if table_data[i][j].detailType != CellType.DetailedDataType.NO_DATA:
-                new.append(table_data[i][j])
+            # Пустая ячейка не заменяет родителя: столбец продолжает
+            # сверяться с последним содержательным значением
+            if child.detailType != DetailedDataType.NO_DATA:
+                marked.append(child)
             else:
-                old[k].rowspan += 1
-                new.append(old[k])
-            j += 1
-            k += 1
+                parent.rowspan += 1
+                marked.append(parent)
 
-        # Если был перерез, old не меняем, просто продолжаем
-        if new == [] and k < len(old):
+            child_index += 1
+            parent_index += 1
+
+        # После переза структура столбцов не меняется
+        if not marked and parent_index < len(parents):
             continue
 
-        # Проверяем, что обработали все ячейки корректно
-        if j != len(table_data[i]):
+        if child_index != len(row):
             raise LayoutError(
-                f'Лишние ячейки в строке {i}: обработано {j}, всего {len(table_data[i])}')
+                f'Лишние ячейки в строке {index}: обработано {child_index}, всего {len(row)}')
 
-        if k != len(old):
-            raise LayoutError(
-                f'Не все родительские ячейки обработаны в строке {i}')
+        if parent_index != len(parents):
+            raise LayoutError(f'Не все родительские ячейки обработаны в строке {index}')
 
-        # Переносим обработанные ячейки в "старые"
-        old = [cell for cell in new]
+        parents = marked
 
-    # Проверяем, что нет "висящих" ячеек с rowspan > 1
-    for cell in old:
+    for cell in parents:
         if cell.rowspan != 1:
             raise LayoutError(
                 f'Ячейка "{cell.content}" имеет rowspan={cell.rowspan}, '
@@ -574,121 +517,204 @@ def get_data(table: Table) -> Table:
 
     return table
 
+
+def _split_parent(row: list, index: int, parent, child_index: int, marked: list) -> int:
+    """
+    Разбирает случай, когда родительская ячейка делится на нескольких потомков.
+
+    Так устроен многоуровневый боковик: падеж "В." разбивается на "одуш."
+    и "неодуш.". Потомки набираются, пока их суммарная ширина не покроет
+    родителя.
+
+    Args:
+        row: текущая строка
+        index: номер строки для сообщений об ошибках
+        parent: родительская ячейка
+        child_index: позиция первого потомка
+        marked: список, куда складываются размеченные ячейки
+
+    Returns:
+        Позицию в строке после последнего потомка
+
+    Raises:
+        LayoutError: потомки шире родителя либо не покрывают его целиком
+        DataTypeError: тип данных потомка несовместим с родителем
+    """
+    covered = 0
+    while child_index < len(row) and covered < parent.colspan:
+        child = row[child_index]
+
+        if covered + child.colspan > parent.colspan:
+            raise LayoutError(
+                f'Несоответствие colspan в строке {index}: потомки ячейки '
+                f'"{parent.content}" (colspan={parent.colspan}) в сумме шире родителя')
+
+        check_data_type_compatibility(parent, child)
+        child.classCell = ClassCell.CELL_DATA
+        marked.append(child)
+        covered += child.colspan
+        child_index += 1
+
+    if covered != parent.colspan:
+        raise LayoutError(
+            f'Несоответствие colspan в строке {index}: родительская ячейка '
+            f'"{parent.content}" имеет colspan={parent.colspan}, '
+            f'а потомки покрывают только {covered}.')
+
+    return child_index
+
+
+def _merge_parents(row: list, parents: list, parent_index: int,
+                   child_index: int, marked: list) -> int:
+    """
+    Разбирает случай, когда один потомок покрывает нескольких родителей.
+
+    Так многоуровневый боковик возвращается на один уровень: строки "В."
+    и "неодуш." вместе занимают ту же ширину, что одна ячейка "Тв." ниже.
+    Сначала строка проверяется как перерез, и только если по типам данных
+    перерезом она не является, рассматривается объединение.
+
+    Объединение допускается лишь в боковике: это первая ячейка строки,
+    покрывающая крайних слева родителей, но не всю строку целиком --
+    строка во всю ширину является перерезом.
+
+    Args:
+        row: текущая строка
+        parents: родительские ячейки
+        parent_index: позиция текущего родителя
+        child_index: позиция потомка
+        marked: список, куда складываются размеченные ячейки
+
+    Returns:
+        Число покрытых родителей либо 0, если это не объединение
+
+    Raises:
+        DataTypeError: строка не является ни перерезом, ни объединением
+    """
+    try:
+        check_cross_section(row)
+    except DataTypeError:
+        merged = 0
+        if parent_index == 0 and child_index == 0:
+            merged = count_merged_parents(parents, parent_index, row[child_index].colspan)
+            if merged >= len(parents):
+                merged = 0
+        if not merged:
+            raise
+
+        child = row[child_index]
+        check_data_type_compatibility(parents[parent_index], child)
+        child.classCell = ClassCell.CELL_DATA
+        marked.append(child)
+
+        return merged
+
+    return 0
+
+
+def _mark_cross_section(rows: list, row: list, index: int, start: int,
+                        parents: list, width: int) -> None:
+    """
+    Размечает перерез -- итоговую строку во всю ширину таблицы.
+
+    Структура столбцов при этом не меняется: следующая строка сверяется
+    с той, что была до переза, как будто переза не было.
+
+    Args:
+        rows: все строки таблицы
+        row: строка переза
+        index: номер строки
+        start: номер первой строки данных
+        parents: родительские ячейки, их rowspan восстанавливается
+        width: ширина таблицы
+
+    Raises:
+        LayoutError: выше переза нет данных либо он не во всю ширину
+    """
+    has_data = any(cell.classCell == ClassCell.CELL_DATA
+                   for earlier in rows[start:index]
+                   for cell in earlier)
+    if not has_data:
+        raise LayoutError(
+            f'Перед перерезом в строке {index} должны быть ячейки с данными (CELL_DATA)')
+
+    total = sum(cell.colspan for cell in row)
+    if total != width:
+        raise LayoutError(
+            f'Перерез в строке {index} должен быть на всю ширину таблицы. '
+            f'Ожидается {width}, получено {total}')
+
+    for cell in row:
+        cell.classCell = ClassCell.CELL_RESULT
+
+    # rowspan был уменьшен в начале строки, а перерез его не расходует
+    for parent in parents:
+        parent.rowspan = 1
+
+
 def get_genuine(table: Table) -> Table:
     """
-    • Если таблица валидна – возвращает сам объект Table в нужной ориентации
-      (top — без изменений, left — transpose)
+    Проверяет, является ли таблица подлинной, в обеих ориентациях.
+
+    Сначала таблица разбирается как имеющая заголовок сверху. Если разбор
+    не удался, она транспонируется и проверяется как имеющая заголовок слева.
+    Возбуждается ошибка первой попытки: она обычно содержательнее.
+
+    Args:
+        table: проверяемая таблица
+
+    Returns:
+        Размеченную таблицу в той ориентации, в которой разбор удался
+
+    Raises:
+        TitleTypeError: в заголовке недопустимый тип данных
+        DataTypeError: типы данных в столбце не согласуются
+        LayoutError: нарушена геометрия таблицы
     """
-    pair = (len(table.table), len(table.table[0]))
-    if (pair in {(0, 0), (0, 1), (1, 0), (1, 1), (1, 2), (2, 1)}) or (len(table.table) == 1) or (all(len(table.table[i]) == 1 for i in range(len(table.table)))):
-        raise LayoutError(f"Таблица слишком малого размера {len(table.table)} на {len(table.table[0])}")
-    if (len(table.table) == 2) and (len(table.table[0]) + len(table.table[1]) == 3):
-        raise LayoutError(f"Таблица слишком малого размера {len(table.table)} на {len(table.table[0])}")
-    # 1) top ───────────────────────────────────────────────────────────────
+    height = len(table.table)
+    widths = [len(row) for row in table.table]
+
+    too_small = (
+        (height, widths[0]) in {(0, 0), (0, 1), (1, 0), (1, 1), (1, 2), (2, 1)}
+        or height == 1
+        or all(size == 1 for size in widths)
+        or (height == 2 and widths[0] + widths[1] == 3)
+    )
+    if too_small:
+        raise LayoutError(f"Таблица слишком малого размера {height} на {widths[0]}")
+
+    # Заголовок сверху
     try:
-        table_ = table.copy
-        vertical_check(table_)
-        return table_
-    except (TitleTypeError, DataTypeError, LayoutError) as first_err:
-        saved_err = first_err  # запоминаем, понадобится если всё рухнет
-        pass
-    # 2) left ──────────────────────────────────────────────────────────────
+        top = table.copy
+        vertical_check(top)
+        return top
+    except (TitleTypeError, DataTypeError, LayoutError) as first_error:
+        saved = first_error
+
+    # Заголовок слева
     try:
-        table_ = table.copy
-        table_.transpose
-        vertical_check(table_)
-        return table_           # заголовок слева
-    except (TitleTypeError, DataTypeError, LayoutError) :
+        left = table.copy
+        left.transpose
+        vertical_check(left)
+        return left
+    except (TitleTypeError, DataTypeError, LayoutError):
         pass
-    raise saved_err
+
+    raise saved
+
 
 def is_genuine(table: Table) -> bool:
-        """
-        Проверяет, является ли таблица подлинной (валидной в любом направлении)
-
-        Returns:
-            True, если таблица валидна хотя бы в одном направлении
-        """
-        try:
-            get_genuine(table)
-            return True
-        except (TitleTypeError, DataTypeError, LayoutError):
-            return False
-
-
-# Пример использования:
-if __name__ == "__main__":
-    from bs4 import BeautifulSoup
-
-    html = """
-    <table border="1" style="border-collapse: collapse; width: 100%;">
-  <thead>
-    <tr>
-      <th rowspan="2">Год</th>
-      <th colspan="3">Среднемесячные показатели</th>
-    </tr>
-    <tr>
-      <th><a></a>Разность, см</th>
-      <th>Абсолютные отметки, м</th>
-      <th>Месяц</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td rowspan="2">2001</td>
-      <td rowspan="2">86</td>
-      <td>max 456.92</td>
-      <td>сентябрь 2001</td>
-    </tr>
-    <tr>
-      <td>min 456.05</td>
-      <td>апрель 2001</td>
-    </tr>
-    <tr>
-      <td rowspan="2">2002</td>
-      <td rowspan="2">64</td>
-      <td>max 456.73</td>
-      <td>август 2002</td>
-    </tr>
-    <tr>
-      <td>min 456.09</td>
-      <td>май 2002</td>
-    </tr>
-    <tr>
-      <td rowspan="2">2003</td>
-      <td rowspan="2">65</td>
-      <td>max 456.69</td>
-      <td>октябрь 2003</td>
-    </tr>
-    <tr>
-      <td>min 456.04</td>
-      <td>май 2003</td>
-    </tr>
-    <tr>
-      <td rowspan="2">2004</td>
-      <td rowspan="2">78</td>
-      <td>max 456.90</td>
-      <td>октябрь 2004</td>
-    </tr>
-    <tr>
-      <td>min 456.12</td>
-      <td>апрель 2004</td>
-    </tr>
-  </tbody>
-</table>
     """
+    Проверяет подлинность таблицы, не возбуждая исключений.
 
-    soup = BeautifulSoup(html, 'html.parser')
-    table_tag = soup.find('table')
+    Args:
+        table: проверяемая таблица
 
-    # Создаем объект Table
-    table = Table(table_tag)
-
+    Returns:
+        True, если таблица разобралась хотя бы в одной ориентации
+    """
     try:
-        good_table = get_genuine(table)
-    except (TitleTypeError, DataTypeError, LayoutError) as err:
-        print(f"⚠️  Таблица некорректна: {err}")
-
-    # Проверяем валидность
-    is_valid = is_genuine(table)
-    print(f"Таблица валидна: {is_valid}")
+        get_genuine(table)
+        return True
+    except (TitleTypeError, DataTypeError, LayoutError):
+        return False

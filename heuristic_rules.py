@@ -6,13 +6,18 @@
 разбора, а не подробности каждой проверки.
 """
 
-import CellType
 from CellType import DataType, DetailedDataType
 
 from heuristic_errors import DataTypeError
 
+# Типы, допустимые в ячейках переза правее его подписи
+CROSS_SECTION_TAIL_TYPES = {DetailedDataType.NO_DATA}
 
-def _count_merged_parents(parents: list, start: int, width: int) -> int:
+# Типы, совместимые между собой в одном столбце
+TEXT_LIKE = {DetailedDataType.LINK, DetailedDataType.STRING}
+
+
+def count_merged_parents(parents: list, start: int, width: int) -> int:
     """
     Определяет, сколько подряд идущих родительских ячеек покрывает один потомок.
 
@@ -38,7 +43,7 @@ def _count_merged_parents(parents: list, start: int, width: int) -> int:
     return 0
 
 
-def _is_section_divider(row: list, parents: list) -> bool:
+def is_section_divider(row: list, parents: list) -> bool:
     """
     Проверяет, является ли строка разделителем секции.
 
@@ -60,83 +65,83 @@ def _is_section_divider(row: list, parents: list) -> bool:
     return row[0].colspan == sum(cell.colspan for cell in parents)
 
 
-def _check_if_cross_section(row: list) -> bool:
+def check_cross_section(row: list) -> None:
     """
-    Проверяет, является ли строка перерезом (итоговой строкой).
+    Проверяет, что строка является перерезом -- итоговой строкой таблицы.
 
-    Перерез должен иметь структуру:
-    - N ячеек NO_DATA (N >= 0)
-    - Ровно 1 ячейка STRING
-    - Остальные ячейки NO_DATA или GENUINE
+    Перерез устроен так: несколько пустых ячеек, ровно одна текстовая
+    (подпись итога), а правее неё -- пустые ячейки либо числа.
+
+    Функция ничего не возвращает: строка либо проходит проверку, либо
+    возбуждается исключение с описанием того, что именно не сошлось.
+    Вызывающий код опирается на это и ловит :class:`DataTypeError`.
 
     Args:
-        row: список ячеек строки
+        row: ячейки проверяемой строки
 
-    Returns:
-        True если строка является перерезом, False иначе
+    Raises:
+        DataTypeError: строка не удовлетворяет описанной структуре
     """
     if not row:
-        return False
-    string_count = 0
-    string_index = -1
+        return
 
-    # Ищем STRING ячейки
-    for idx, cell in enumerate(row):
-        if cell.detailType == CellType.DetailedDataType.STRING:
-            string_count += 1
-            string_index = idx
-    # Должна быть ровно одна STRING ячейка
-    if string_count != 1:
-        err = ''
-        for cell in row:
-            err += cell.content + ' | '
-        raise DataTypeError(f'в строке таблицы \n "{err}" \n нет типа данных строка')
+    labels = [index for index, cell in enumerate(row)
+              if cell.detailType == DetailedDataType.STRING]
 
-    # Проверяем ячейки до STRING - должны быть NO_DATA
-    for i in range(string_index):
-        a = row[0]
-        if row[i].detailType != CellType.DetailedDataType.NO_DATA:
-            raise DataTypeError(f'ячейка "{row[i].content}" с типом данных {row[i].content} в срезе не соответствующих типу данных "{CellType.DetailedDataType.NO_DATA}" ')
+    if len(labels) != 1:
+        contents = ' | '.join(cell.content for cell in row)
+        raise DataTypeError(
+            f'в строке таблицы \n "{contents} | " \n нет типа данных строка')
 
-    # Проверяем ячейки после STRING - должны быть NO_DATA или GENUINE
-    for i in range(string_index + 1, len(row)):
-        detail_type = row[i].detailType
-        data_type = row[i].type
+    label = labels[0]
 
-        if detail_type != CellType.DetailedDataType.NO_DATA and \
-                data_type != CellType.DataType.GENUINE:
-            raise DataTypeError(f'ячейка "{row[i].content}" с типом данных {row[i].content} в срезе не соответствующих типу данных')
+    # Слева от подписи перерез пуст
+    for cell in row[:label]:
+        if cell.detailType != DetailedDataType.NO_DATA:
+            raise DataTypeError(
+                f'ячейка "{cell.content}" с типом данных {cell.detailType} '
+                f'в срезе не соответствует типу данных "{DetailedDataType.NO_DATA}"')
 
-def _check_data_type_compatibility(parent_cell, child_cell):
+    # Справа от подписи стоят итоговые значения либо пустые ячейки
+    for cell in row[label + 1:]:
+        if cell.detailType not in CROSS_SECTION_TAIL_TYPES and cell.type != DataType.GENUINE:
+            raise DataTypeError(
+                f'ячейка "{cell.content}" с типом данных {cell.detailType} '
+                f'в срезе не соответствует ни пустой ячейке, ни числу')
+
+
+def check_data_type_compatibility(parent_cell, child_cell) -> None:
     """
-    Вспомогательная функция для проверки совместимости типов данных в столбце.
+    Проверяет, что типы данных родительской и дочерней ячеек согласуются.
 
-    Правила:
-    - Если родитель имеет определенный тип, потомок должен иметь тот же или NO_DATA
-    - STRING и LINK совместимы между собой
-    - NO_DATA совместим со всем
+    В подлинной таблице столбец однороден по типу. Правила послабления:
+
+    * совпадающие типы согласуются всегда;
+    * пустая ячейка согласуется с любым типом -- как со стороны потомка,
+      так и со стороны родителя;
+    * текст и ссылка считаются одним типом: ссылка почти всегда подписана
+      текстом и несёт ту же величину.
+
+    Args:
+        parent_cell: ячейка предыдущей строки того же столбца
+        child_cell: ячейка текущей строки
+
+    Raises:
+        DataTypeError: типы несовместимы, столбец неоднороден
     """
-    old_type = parent_cell.detailType
-    new_type = child_cell.detailType
-    # Типы совпадают - ОК
-    if old_type == new_type:
+    parent_type = parent_cell.detailType
+    child_type = child_cell.detailType
+
+    if parent_type == child_type:
         return
 
-    # Потомок пустой - наследует тип родителя
-    if new_type == DetailedDataType.NO_DATA:
+    if DetailedDataType.NO_DATA in (parent_type, child_type):
         return
 
-    # Родитель пустой - потомок устанавливает тип
-    if old_type == DetailedDataType.NO_DATA:
+    if parent_type in TEXT_LIKE and child_type in TEXT_LIKE:
         return
 
-    # STRING и LINK совместимы
-    if (new_type in {DetailedDataType.LINK, DetailedDataType.STRING} and
-            old_type in {DetailedDataType.LINK, DetailedDataType.STRING}):
-        return
-
-    # Несовместимые типы
     raise DataTypeError(
         f'Несовместимые типы данных в столбце:\n'
-        f'  Родительская ячейка: "{parent_cell.content}" (тип: {old_type})\n'
-        f'  Дочерняя ячейка: "{child_cell.content}" (тип: {new_type})')
+        f'  Родительская ячейка: "{parent_cell.content}" (тип: {parent_type})\n'
+        f'  Дочерняя ячейка: "{child_cell.content}" (тип: {child_type})')
