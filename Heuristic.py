@@ -1,4 +1,3 @@
-from numba.core.ir_utils import is_return
 
 import CellType
 from Table import Table
