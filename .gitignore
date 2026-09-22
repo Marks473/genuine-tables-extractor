@@ -1,0 +1,19 @@
+# Виртуальное окружение
+.venv/
+venv/
+
+# Кэш Python и pytest
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Рабочие каталоги обучения
+catboost_temp/
+
+# Среды разработки
+.idea/
+.vscode/
+
+# Отчёты и срезы, создаваемые при прогонах
+mismatch_report.html
+snapshot*.json
