@@ -1,6 +1,7 @@
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 import comparisonML
+import Heuristic
 from CellType import DataType
 import joblib
 import pandas as pd
@@ -107,7 +108,11 @@ def get_parameters_from_table(table: Table) -> pd.Series:
         series = series / sum_type
     else:
         series[:] = -1
-    series['consistency'] = 1
+
+    # Сначала эвристика: не прошедшую проверку структуры таблицу модель
+    # не классифицирует, GenuineModelWrapper сразу отвечает "no genuine".
+    # Проверяется копия: разбор меняет классы ячеек и объединения
+    series['consistency'] = 1 if Heuristic.is_genuine(table.copy) else -1
 
     return series
 

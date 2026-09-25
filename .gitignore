@@ -17,3 +17,6 @@ catboost_temp/
 # Отчёты и срезы, создаваемые при прогонах
 mismatch_report.html
 snapshot*.json
+
+# Раскрашенные страницы, создаваемые tools/highlight_tables.py
+*_highlighted.html

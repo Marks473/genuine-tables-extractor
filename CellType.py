@@ -130,6 +130,11 @@ DATE_PATTERNS = [
 
     # Форматы: "2024 January 15", "2024 January"
     r'\b\d{4}\s+(January|February|March|April|May|June|July|August|September|October|November|December)(?:\s+\d{1,2})?\b',
+
+    # Форматы: "Feb '25", "Sept. '24" -- месяц и год без числа, апостроф прямой
+    # либо типографский.
+    # Только вся ячейка целиком: внутри фразы "out since Mar '25" это не дата
+    r'^\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sept?|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December)\.?\s*[\'’]\d{2}\s*$',
 ]
 
 # Паттерны для времени

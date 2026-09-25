@@ -257,5 +257,96 @@ class test_wiktionary(unittest.TestCase):
         self._assert_genuine(19)
 
 
+# Отчёт о травмах FanGraphs: по таблице на команду
+INJURY_TABLES = range(49, 79)
+
+# Классы ячеек, которые означают заголовок строки или столбца
+HEADER_CLASSES = {ClassCell.CELL_TITLE, ClassCell.CELL_SIDEBAR}
+
+
+class test_fangraphs(unittest.TestCase):
+    """
+    Таблицы FanGraphs: как эвристика размечает области подлинных таблиц.
+
+    Тесты с @unittest.expectedFailure описывают известные слабости эвристики:
+    они проверяют правильный ответ, которого эвристика пока не даёт.
+    Когда слабость будет устранена, unittest сообщит о них как
+    об "unexpected success" -- тогда декоратор надо снять.
+    """
+    @classmethod
+    def setUpClass(cls):
+        html_path = "table_for_test.html"
+        with open(html_path, "r", encoding="utf-8") as f:
+            soup = BeautifulSoup(f, "html.parser")
+        cls.tables = soup.find_all("table", recursive=True)
+
+    def _genuine(self, index):
+        table = Table(self.tables[index]).copy
+        try:
+            return Heuristic.get_genuine(table).table
+        except(Exception) as err:
+            self.fail(f"Функция get_genuine() неожиданно выбросила исключение: {err}")
+
+    def _cell(self, table_data, prefix):
+        for row in table_data:
+            for cell in row:
+                if cell.content.startswith(prefix):
+                    return cell
+        self.fail(f'Ячейка "{prefix}" не найдена')
+
+    def _assert_numbers_are_data(self, table_data):
+        """Числа -- данные, всё остальное -- заголовки строк или столбцов"""
+        for row in table_data:
+            for cell in row:
+                if cell.type == CellType.DataType.GENUINE:
+                    self.assertEqual(cell.classCell, ClassCell.CELL_DATA,
+                                     f'{cell.content} должен быть ячейкой - данных')
+                else:
+                    self.assertIn(cell.classCell, HEADER_CLASSES,
+                                  f'{cell.content} должен быть заголовком или боковиком')
+
+    def test_injury_report(self):
+        """Отчёт о травмах: шапка -- заголовок, имя игрока -- боковик, остальное -- данные"""
+        for index in INJURY_TABLES:
+            with self.subTest(table=index):
+                table_data = self._genuine(index)
+                for cell in table_data[0]:
+                    self.assertEqual(cell.classCell, ClassCell.CELL_TITLE,
+                                     f'{cell.content} должен быть заголовком')
+                self.assertEqual(table_data[1][0].classCell, ClassCell.CELL_SIDEBAR,
+                                 f'{table_data[1][0].content} должен быть ячейкой - боковик')
+                for cell in table_data[1][1:]:
+                    self.assertEqual(cell.classCell, ClassCell.CELL_DATA,
+                                     f'{cell.content} должен быть ячейкой - данных')
+
+    def test_48_career_key_value(self):
+        """Итоги карьеры: названия показателей -- заголовки, значения -- данные"""
+        table_data = self._genuine(47)
+        self.assertEqual(self._cell(table_data, 'IP').classCell, ClassCell.CELL_TITLE,
+                         'IP должен быть заголовком')
+        self.assertEqual(self._cell(table_data, '683.1').classCell, ClassCell.CELL_DATA,
+                         '683.1 должен быть ячейкой - данных')
+
+    # Таблица без шапки: эвристика всегда считает первую строку заголовком,
+    # поэтому после поворота столбец побед становится боковиком
+    @unittest.expectedFailure
+    def test_32_standings(self):
+        """Турнирные таблицы без шапки: команды -- боковик, числа -- данные"""
+        for index in range(31, 37):
+            with self.subTest(table=index):
+                self._assert_numbers_are_data(self._genuine(index))
+
+    # "Ключ -- значение" разобрана с заголовком сверху: первая пара
+    # "Draft:" / "2002, Rd: 15 ..." целиком ушла в заголовок
+    @unittest.expectedFailure
+    def test_49_draft_key_value(self):
+        """Данные драфта: значение -- данные, а не заголовок"""
+        table_data = self._genuine(48)
+        self.assertIn(self._cell(table_data, 'Draft:').classCell, HEADER_CLASSES,
+                      'Draft: должен быть заголовком или боковиком')
+        self.assertEqual(self._cell(table_data, '2002').classCell, ClassCell.CELL_DATA,
+                         '2002, Rd: 15 ... должен быть ячейкой - данных')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

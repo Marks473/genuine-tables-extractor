@@ -745,6 +745,28 @@ class TestCellTypeDetectionDetailedDataType(unittest.TestCase):
                            f"Должен быть DATE для: {cell._content}")
         print("✅ Тест 4.11: DetailedDataType.DATE для английских дат")
 
+    def test_detailedtype_date_month_year_apostrophe(self):
+        """Тест 4.11a: DetailedDataType.DATE для месяца и года с апострофом."""
+        test_cases = [
+            "<td>Feb '25</td>",
+            "<td>Mar '26</td>",
+            "<td>Sept. '24</td>",
+            "<td>Nov ’25</td>",
+        ]
+        for html in test_cases:
+            tag = BeautifulSoup(html, 'html.parser').find('td')
+            cell = Cell(tag)
+            actual_type = CellType.detailType(tags=cell.tags, contents=cell._content)
+            self.assertEqual(actual_type, DetailedDataType.DATE,
+                           f"Должен быть DATE для: {cell._content}")
+
+        # Внутри фразы месяц с годом датой ячейку не делает
+        tag = BeautifulSoup("<td>Out since Mar '25 with elbow pain</td>", 'html.parser').find('td')
+        cell = Cell(tag)
+        self.assertEqual(CellType.detailType(tags=cell.tags, contents=cell._content),
+                         DetailedDataType.STRING)
+        print("✅ Тест 4.11a: DetailedDataType.DATE для месяца и года с апострофом")
+
     def test_detailedtype_date_with_formatting(self):
         """Тест 4.12: DetailedDataType.DATE с тегами форматирования."""
         test_cases = [

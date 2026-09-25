@@ -59,5 +59,53 @@ class test_wiktionary_main_page(unittest.TestCase):
         self._assert_not_genuine(26)
 
 
+class test_fangraphs(unittest.TestCase):
+    """Таблицы FanGraphs: меню, сетки ссылок и блоки-анонсы -- вёрстка, остальное -- данные"""
+    @classmethod
+    def setUpClass(cls):
+        html_path = "table_for_test.html"
+        with open(html_path, "r", encoding="utf-8") as f:
+            soup = BeautifulSoup(f, "html.parser")
+        cls.tables = soup.find_all("table", recursive=True)
+        cls.verifier = MLVerification()
+
+    def _assert_verdict(self, indexes, expected):
+        for index in indexes:
+            with self.subTest(table=index):
+                table = Table(self.tables[index]).copy
+                verdict = self.verifier.predict(table)
+                self.assertEqual(verdict, expected,
+                                 f'Таблица с индексом {index}: ожидалось "{expected}", '
+                                 f'конвейер вернул "{verdict}"')
+
+    def test_28_menu_frames(self):
+        """Обёртки меню сайта, в которые вложены таблицы"""
+        self._assert_verdict([27, 30], 'no genuine')
+
+    def test_38_link_grids(self):
+        """Меню и сетки ссылок на команды"""
+        self._assert_verdict(range(37, 43), 'no genuine')
+
+    def test_29_games(self):
+        """Списки матчей в меню сайта"""
+        self._assert_verdict([28, 29], 'no genuine')
+
+    def test_32_standings(self):
+        """Турнирные таблицы дивизионов без шапки"""
+        self._assert_verdict(range(31, 37), 'genuine')
+
+    def test_44_war_rating(self):
+        """Рейтинги WAR на главной: блоки-анонсы полного рейтинга"""
+        self._assert_verdict(range(43, 47), 'no genuine')
+
+    def test_48_key_value(self):
+        """Карточки «ключ -- значение»: итоги карьеры и данные драфта"""
+        self._assert_verdict([47, 48], 'genuine')
+
+    def test_50_injury_report(self):
+        """Отчёт о травмах, по таблице на команду"""
+        self._assert_verdict(range(49, 79), 'genuine')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
