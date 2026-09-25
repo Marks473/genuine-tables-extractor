@@ -218,5 +218,44 @@ class test_sidebar(unittest.TestCase):
         good_table = Heuristic.get_genuine(table)
 
 
+class test_wiktionary(unittest.TestCase):
+    """Таблицы со страницы Викисловаря «Шаблоны словоизменений/Глаголы»: все подлинные"""
+    @classmethod
+    def setUpClass(cls):
+        html_path = "table_for_test.html"
+        with open(html_path, "r", encoding="utf-8") as f:
+            soup = BeautifulSoup(f, "html.parser")
+        cls.tables = soup.find_all("table", recursive=True)
+
+    def _assert_genuine(self, index):
+        table = Table(self.tables[index]).copy
+        try:
+            return Heuristic.get_genuine(table)
+        except(Exception) as err:
+            self.fail(f"Функция get_genuine() неожиданно выбросила исключение: {err}")
+
+    def test_17_conjugation_types(self):
+        """Таблица типов спряжения"""
+        table_data = self._assert_genuine(16).table
+        self.assertEqual(table_data[1][0].classCell, ClassCell.CELL_SIDEBAR,
+                         f'{table_data[1][0].content} должен быть ячейкой - боковик')
+        self.assertEqual(table_data[2][0].classCell, ClassCell.CELL_DATA,
+                         f'{table_data[2][0].content} должен быть ячейкой - данных')
+        self.assertEqual(table_data[7][1].classCell, ClassCell.CELL_DATA,
+                         f'{table_data[7][1].content} должен быть ячейкой - данных')
+
+    def test_18_consonant_alternation(self):
+        """Стандартные чередования согласных"""
+        self._assert_genuine(17)
+
+    def test_19_stress_present(self):
+        """Образцы основных схем ударения настоящего времени"""
+        self._assert_genuine(18)
+
+    def test_20_stress_past(self):
+        """Образцы основных схем ударения прошедшего времени"""
+        self._assert_genuine(19)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

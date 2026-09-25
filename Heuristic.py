@@ -124,7 +124,7 @@ def vertical_check(table: Table) -> Table:
 
 
 def _mark_block(rows: list, allowed: set, role_class, role: str, skip: set,
-                close, strict: bool, dead_end: str) -> None:
+                close, strict: bool, dead_end: str, split_data: bool = False) -> None:
     """
     Общий обход блока заголовков или боковика.
 
@@ -147,6 +147,12 @@ def _mark_block(rows: list, allowed: set, role_class, role: str, skip: set,
         close: функция разметки первой строки данных
         strict: требовать, чтобы строка целиком покрывала родителей
         dead_end: сообщение, если строка данных так и не нашлась
+        split_data: допускать, что в первой строке данных одни родители
+            дробятся на несколько ячеек, а другие продолжаются одной. Так
+            устроен боковик, за которым идёт столбец данных с объединениями:
+            номер типа спряжения "1" делится на окончания "-ать", "-ять",
+            "-еть", а номер "3" продолжается одним окончанием "-нуть".
+            Действует только для одноуровневого блока, см. :func:`_close_sidebar`
 
     Raises:
         TitleTypeError: в блоке встретился недопустимый тип данных
@@ -179,7 +185,7 @@ def _mark_block(rows: list, allowed: set, role_class, role: str, skip: set,
         child_index = 0   # позиция в текущей строке
         parent_index = 0  # позиция в списке родителей
         covered = 0       # ширина, уже покрытая потомками текущего родителя
-        consumed = 0      # сколько потомков уже отнесено к блоку
+        consumed = []     # потомки этой строки, уже отнесённые к блоку
 
         while parent_index < len(parents):
             child_index = _next_child(row, child_index, skip)
@@ -207,10 +213,15 @@ def _mark_block(rows: list, allowed: set, role_class, role: str, skip: set,
             # Ширина сошлась, и потомок был первым и единственным:
             # блок кончился, эта строка -- первая строка данных
             if width == parent.colspan and covered == 0:
-                if consumed > 0:
+                if consumed and not (split_data and index == 1):
                     raise LayoutError(
                         f'Блок роли <<{role}>> зубчатый: ячейка данных '
                         f'"{child.content}" находится правее ячейки блока')
+
+                # Блок кончился уровнем выше: ячейки, дробившие родителей
+                # в этой строке, -- тоже данные, а не продолжение блока
+                for cell in consumed:
+                    cell.classCell = ClassCell.CELL_DATA
 
                 close(row, index, parents, parent_index, child_index)
                 return
@@ -218,7 +229,7 @@ def _mark_block(rows: list, allowed: set, role_class, role: str, skip: set,
             _require_type(child, HEADER_TYPES, role)
             child.classCell = role_class
             marked.append(child)
-            consumed += 1
+            consumed.append(child)
             child_index += 1
 
             # Родитель покрыт целиком -- переходим к следующему
@@ -340,7 +351,8 @@ def get_sidebar(table: Table) -> Table:
 
     _mark_block(table.table, HEADER_TYPES, ClassCell.CELL_SIDEBAR, "боковик",
                 skip=PRECLASSIFIED, close=_close_sidebar, strict=False,
-                dead_end="В таблице нет ячеек данных - только боковики")
+                dead_end="В таблице нет ячеек данных - только боковики",
+                split_data=True)
 
     table.reset_span()
     table.transpose
@@ -356,6 +368,12 @@ def _close_sidebar(row: list, index: int, parents: list,
     В отличие от :func:`_close_head`, уже размеченные классы не перезаписываются,
     а родитель с ``rowspan == 1`` пропускается: боковик мог закончиться раньше
     остальных столбцов.
+
+    Если боковик одноуровневый, родитель может покрываться несколькими
+    ячейками данных общей ширины: такой боковик группирует строки, и группы
+    разной высоты для него обычны. В многоуровневом боковике нижний уровень
+    для того и нужен, чтобы дробить строки, поэтому он обязан соответствовать
+    строкам данных один к одному.
 
     Args:
         row: первый столбец данных, в транспонированном виде -- строка
@@ -386,22 +404,29 @@ def _close_sidebar(row: list, index: int, parents: list,
             parent_index += 1
             continue
 
-        if child_index >= len(row):
-            raise LayoutError(
-                f'Недостаточно ячеек данных в строке {index}: '
-                f'ожидалось покрытие ячейки "{parent.content}"')
+        # Одноуровневый боковик данные могут дробить, как в get_data,
+        # но не выходить за его границы
+        covered = 0
+        while covered < parent.colspan:
+            child_index = _next_child(row, child_index, PRECLASSIFIED)
+            if child_index >= len(row):
+                raise LayoutError(
+                    f'Недостаточно ячеек данных в строке {index}: '
+                    f'ожидалось покрытие ячейки "{parent.content}"')
 
-        child = row[child_index]
-        if child.colspan != parent.colspan:
-            raise LayoutError(
-                f'Боковики "зубчатые": ячейка данных "{child.content}" '
-                f'(colspan={child.colspan}) не соответствует '
-                f'боковику "{parent.content}" (colspan={parent.colspan})')
+            child = row[child_index]
+            covered += child.colspan
+            if covered > parent.colspan or (covered < parent.colspan and index > 1):
+                raise LayoutError(
+                    f'Боковики "зубчатые": ячейка данных "{child.content}" '
+                    f'(colspan={child.colspan}) не соответствует '
+                    f'боковику "{parent.content}" (colspan={parent.colspan})')
 
-        if child.classCell not in KEEP_CLASS:
-            child.classCell = ClassCell.CELL_DATA
+            if child.classCell not in KEEP_CLASS:
+                child.classCell = ClassCell.CELL_DATA
+            child_index += 1
+
         parent_index += 1
-        child_index += 1
 
 
 
@@ -486,11 +511,12 @@ def get_data(table: Table) -> Table:
             child.classCell = ClassCell.CELL_DATA
 
             # Пустая ячейка не заменяет родителя: столбец продолжает
-            # сверяться с последним содержательным значением
+            # сверяться с последним содержательным значением. Родитель
+            # перенимает высоту пустой ячейки, иначе её rowspan теряется
             if child.detailType != DetailedDataType.NO_DATA:
                 marked.append(child)
             else:
-                parent.rowspan += 1
+                parent.rowspan += child.rowspan
                 marked.append(parent)
 
             child_index += 1
