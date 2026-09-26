@@ -180,12 +180,17 @@ class Table:
         os.startfile(path)
 
 
-def write_to_excel(tables, output_excel_path: str):
+def write_to_excel(tables, output_excel_path, colored: bool = True, sheet_names=None):
     """
     Функция для записи таблиц в Excel с цветовым выделением и границами.
     Параметры:
         tables: список таблиц (объекты вашего класса, содержащие .table)
-        output_excel_path: путь для сохранения Excel-файла.
+        output_excel_path: путь для сохранения Excel-файла либо файловый
+            объект, например io.BytesIO, если файл нужен в памяти.
+        colored: заливать ячейки цветом их класса. Без заливки остаются
+            только границы и объединения ячеек.
+        sheet_names: имена листов по одному на таблицу; по умолчанию
+            листы называются Таблица_1, Таблица_2 и так далее.
     """
     # Определяем стили заливки
     title_fill = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
@@ -203,7 +208,7 @@ def write_to_excel(tables, output_excel_path: str):
     if wb.active:
         wb.remove(wb.active)
     for idx, table in enumerate(tables, start=1):
-        sheet_name = f"Таблица_{idx}"
+        sheet_name = sheet_names[idx - 1] if sheet_names else f"Таблица_{idx}"
         ws = wb.create_sheet(title=sheet_name)
 
         occupied = {}
@@ -222,17 +227,18 @@ def write_to_excel(tables, output_excel_path: str):
                 # --- 3. Применяем стиль границ КО ВСЕМ ячейкам ---
                 target_cell.border = thin_border
                 # Применяем заливку в зависимости от типа
-                if cell_obj.classCell == CellType.ClassCell.CELL_TITLE:
-                    target_cell.fill = title_fill
-                elif cell_obj.classCell == CellType.ClassCell.CELL_DATA:
-                    target_cell.fill = data_fill
-                    target_cell.font = white_font
-                elif cell_obj.classCell == CellType.ClassCell.CELL_RESULT:
-                    target_cell.fill = result_fill
-                elif cell_obj.classCell == CellType.ClassCell.CELL_NOT_DEFINE:
-                    target_cell.fill = not_define_fill
-                elif cell_obj.classCell == CellType.ClassCell.CELL_SIDEBAR:
-                    target_cell.fill = sidebar_fill
+                if colored:
+                    if cell_obj.classCell == CellType.ClassCell.CELL_TITLE:
+                        target_cell.fill = title_fill
+                    elif cell_obj.classCell == CellType.ClassCell.CELL_DATA:
+                        target_cell.fill = data_fill
+                        target_cell.font = white_font
+                    elif cell_obj.classCell == CellType.ClassCell.CELL_RESULT:
+                        target_cell.fill = result_fill
+                    elif cell_obj.classCell == CellType.ClassCell.CELL_NOT_DEFINE:
+                        target_cell.fill = not_define_fill
+                    elif cell_obj.classCell == CellType.ClassCell.CELL_SIDEBAR:
+                        target_cell.fill = sidebar_fill
                 rowspan = cell_obj.rowspan_original
                 colspan = cell_obj.colspan_original
                 if rowspan > 1 or colspan > 1:
